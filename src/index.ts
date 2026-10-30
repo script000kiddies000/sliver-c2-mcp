@@ -1540,8 +1540,10 @@ async def execute_command(client, command, params):
 asyncio.run(main())
 `;
 
+    const beaconTimeout = typeof params.timeout === "number" ? params.timeout * 1000 : 0;
+    const spawnTimeout = Math.max(config.timeout, beaconTimeout + 30000);
     const python = spawn(config.pythonPath, ["-c", pythonScript], {
-      timeout: config.timeout,
+      timeout: spawnTimeout,
     });
 
     let stdout = "";
