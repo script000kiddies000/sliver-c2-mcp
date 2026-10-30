@@ -482,7 +482,7 @@ async def execute_command(client, command, params):
             Args=args_bytes,
             Request=_common_pb2ce.Request(BeaconID=beacon_id, Async=True)
         )
-        resp = await client._stub.CallExtension(req, metadata=client._metadata)
+        resp = await client._stub.CallExtension(req)
         task_id = resp.Response.TaskID if resp.Response else ""
 
         if not task_id:
@@ -531,7 +531,7 @@ async def execute_command(client, command, params):
         msg = _sliver_pb2.OpenSession(
             Request=_common_pb2.Request(BeaconID=beacon_id)
         )
-        await client._stub.OpenSession(msg, metadata=client._metadata)
+        await client._stub.OpenSession(msg)
 
         # Poll for new session to appear (beacon must check in to execute)
         deadline = _time.time() + timeout_secs
