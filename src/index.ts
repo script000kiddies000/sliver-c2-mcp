@@ -571,9 +571,12 @@ async def execute_command(client, command, params):
         if not beacon_id or not exe:
             return {"error": "beacon_id and exe required"}
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.execute(exe, args_exec, output)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2
+        req = _sliver_pb2.ExecuteReq(Path=exe, Args=args_exec, Output=output, Request=_common_pb2.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Execute(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Execute gRPC failed"}
 
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
@@ -607,9 +610,13 @@ async def execute_command(client, command, params):
         with open(local_path, 'rb') as _f:
             data = _f.read()
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.upload(remote_path, data)
-        task_id = task.ID
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2up
+        from sliver.pb.commonpb import common_pb2 as _common_pb2up
+        req = _sliver_pb2up.UploadReq(Path=remote_path, Data=data, Request=_common_pb2up.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Upload(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Upload gRPC failed"}
 
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
@@ -630,9 +637,13 @@ async def execute_command(client, command, params):
         if not beacon_id:
             return {"error": "beacon_id required"}
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.screenshot()
-        task_id = task.ID
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2sc
+        from sliver.pb.commonpb import common_pb2 as _common_pb2sc
+        req = _sliver_pb2sc.ScreenshotReq(Request=_common_pb2sc.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Screenshot(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Screenshot gRPC failed"}
 
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
@@ -661,9 +672,12 @@ async def execute_command(client, command, params):
         if not beacon_id or not remote_path:
             return {"error": "beacon_id and remote_path required"}
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.download(remote_path)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2dl
+        req = _sliver_pb2d.DownloadReq(Path=remote_path, Request=_common_pb2dl.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Download(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Download gRPC failed"}
 
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
@@ -698,9 +712,12 @@ async def execute_command(client, command, params):
         if not beacon_id:
             return {"error": "beacon_id required"}
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.ls(path)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2ls2
+        req = _sliver_pb2ls.LsReq(Path=path, Request=_common_pb2ls2.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Ls(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Ls gRPC failed"}
 
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
@@ -727,9 +744,12 @@ async def execute_command(client, command, params):
         if not beacon_id:
             return {"error": "beacon_id required"}
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.ps()
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2ps2
+        req = _sliver_pb2ps.PsReq(Request=_common_pb2ps2.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Ps(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Ps gRPC failed"}
 
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
@@ -755,9 +775,12 @@ async def execute_command(client, command, params):
         if not beacon_id:
             return {"error": "beacon_id required"}
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.ifconfig()
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2if2
+        req = _sliver_pb2if.IfconfigReq(Request=_common_pb2if2.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Ifconfig(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Ifconfig gRPC failed"}
 
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
@@ -786,9 +809,12 @@ async def execute_command(client, command, params):
         if not beacon_id or not reg_path or not key:
             return {"error": "beacon_id, path, and key required"}
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.registry_read(hive, reg_path, key, "")
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2rr
+        req = _sliver_pb2reg.RegistryReadReq(Hive=hive, Path=reg_path, Key=key, Request=_common_pb2rr.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.RegistryRead(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — RegistryRead gRPC failed"}
 
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
@@ -820,9 +846,12 @@ async def execute_command(client, command, params):
         type_map = {"REG_SZ": 1, "REG_EXPAND_SZ": 2, "REG_BINARY": 3, "REG_DWORD": 4, "REG_QWORD": 11}
         reg_type_int = type_map.get(reg_type, 1)
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.registry_write(hive, reg_path, key, "", string_value, b"", dword_value, 0, reg_type_int)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2rw2
+        req = _sliver_pb2rw.RegistryWriteReq(Hive=hive, Path=reg_path, Key=key, StringValue=string_value, DWordValue=dword_value, Type=reg_type_int, Request=_common_pb2rw2.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.RegistryWrite(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — RegistryWrite gRPC failed"}
 
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
@@ -884,9 +913,12 @@ async def execute_command(client, command, params):
         with open(assembly_path, 'rb') as _f:
             assembly_data = _f.read()
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.execute_assembly(assembly_data, arguments, process, is_dll, arch, class_name, method, app_domain)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2asm2
+        req = _sliver_pb2asm.ExecuteAssemblyReq(Assembly=assembly_data, Arguments=arguments, Process=process, IsDLL=is_dll, Arch=arch, ClassName=class_name, Method=method, AppDomain=app_domain, Request=_common_pb2asm2.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.ExecuteAssembly(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — ExecuteAssembly gRPC failed"}
 
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
