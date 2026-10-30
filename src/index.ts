@@ -74,7 +74,7 @@ async def main():
         await client.connect()
 
         command = ${JSON.stringify(command)}
-        params = ${JSON.stringify(params)}
+        params = json.loads(${JSON.stringify(JSON.stringify(params))})
 
         result = await execute_command(client, command, params)
         print(json.dumps({"success": True, "data": result}))
